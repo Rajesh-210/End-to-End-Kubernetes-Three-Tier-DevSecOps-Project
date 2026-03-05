@@ -1,0 +1,165 @@
+pipeline {
+
+    agent any
+
+    tools {
+        jdk 'jdk'
+        nodejs 'nodejs'
+    }
+
+    environment {
+
+        SCANNER_HOME = tool 'sonar-scanner'
+        ODC_HOME = tool 'DP-Check'
+
+        AWS_ACCOUNT_ID = credentials('ACCOUNT_ID')
+        AWS_ECR_REPO_NAME = credentials('ECR_REPO1')
+
+        AWS_DEFAULT_REGION = 'us-east-1'
+        REPOSITORY_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+
+        GIT_REPO_NAME = "End-to-End-Kubernetes-Three-Tier-DevSecOps-Project"
+        GIT_USER_NAME = "Rajesh-210"
+    }
+
+    stages {
+
+        stage('Cleaning Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout from Git') {
+            steps {
+                git branch: 'master',
+                credentialsId: 'GITHUB',
+                url: 'https://github.com/Rajesh-210/End-to-End-Kubernetes-Three-Tier-DevSecOps-Project.git'
+            }
+        }
+
+        stage('Sonarqube Analysis') {
+            steps {
+                dir('Application-Code/frontend') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh """
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                        -Dsonar.projectName=three-tier-frontend \
+                        -Dsonar.projectKey=three-tier-frontend
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Quality Check') {
+            steps {
+                script {
+                    def qg = waitForQualityGate abortPipeline: false
+                    echo "Quality Gate Status: ${qg.status}"
+                }
+            }
+        }
+
+        stage('OWASP Dependency Check Scan') {
+            steps {
+                dir('Application-Code/frontend') {
+
+                    sh '''
+                    ${ODC_HOME}/bin/dependency-check.sh \
+                    --project three-tier-frontend \
+                    --scan ./ \
+                    --format XML \
+                    --out . || true
+                    '''
+
+                    echo "OWASP Scan Completed"
+                }
+            }
+        }
+
+        stage('Trivy File Scan') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh '''
+                    trivy fs . || true
+                    '''
+                }
+            }
+        }
+
+        stage('Docker Image Build') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh '''
+                    docker system prune -f
+                    docker container prune -f
+
+                    docker build -t $AWS_ECR_REPO_NAME:$BUILD_NUMBER .
+                    '''
+                }
+            }
+        }
+
+        stage('ECR Image Pushing') {
+            steps {
+
+                sh '''
+                aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+                docker login --username AWS --password-stdin $REPOSITORY_URI
+
+                docker tag $AWS_ECR_REPO_NAME:$BUILD_NUMBER \
+                $REPOSITORY_URI/$AWS_ECR_REPO_NAME:$BUILD_NUMBER
+
+                docker push $REPOSITORY_URI/$AWS_ECR_REPO_NAME:$BUILD_NUMBER
+                '''
+            }
+        }
+
+        stage('TRIVY Image Scan') {
+            steps {
+
+                sh '''
+                trivy image $REPOSITORY_URI/$AWS_ECR_REPO_NAME:$BUILD_NUMBER || true
+                '''
+            }
+        }
+
+        stage('Checkout Code for Deployment Update') {
+            steps {
+
+                git branch: 'master',
+                credentialsId: 'GITHUB',
+                url: 'https://github.com/Rajesh-210/End-to-End-Kubernetes-Three-Tier-DevSecOps-Project.git'
+            }
+        }
+
+        stage('Update Deployment file') {
+
+            steps {
+
+                dir('Kubernetes-Manifests-file/Frontend') {
+
+                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+
+                        sh '''
+
+                        git config user.email "rajeshchilukuri210@gmail.com"
+                        git config user.name "Rajesh-210"
+
+                        imageTag=$(grep -oP '(?<=frontend:)[^ ]+' deployment.yaml)
+
+                        sed -i "s/$AWS_ECR_REPO_NAME:$imageTag/$AWS_ECR_REPO_NAME:$BUILD_NUMBER/" deployment.yaml
+
+                        git add deployment.yaml
+
+                        git commit -m "Update deployment image to version $BUILD_NUMBER" || echo "No changes"
+
+                        git push https://$GITHUB_TOKEN@github.com/$GIT_USER_NAME/$GIT_REPO_NAME HEAD:master
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
